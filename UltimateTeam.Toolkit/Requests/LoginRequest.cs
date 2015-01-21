@@ -17,6 +17,8 @@ namespace UltimateTeam.Toolkit.Requests
     {
         private readonly LoginDetails _loginDetails;
 
+        private readonly ITwoFactorCodeProvider _twoFactorCodeProvider;
+
         private IHasher _hasher;
 
         public IHasher Hasher
@@ -25,10 +27,11 @@ namespace UltimateTeam.Toolkit.Requests
             set { _hasher = value; }
         }
 
-        public LoginRequest(LoginDetails loginDetails)
+        public LoginRequest(LoginDetails loginDetails, ITwoFactorCodeProvider twoFactorCodeProvider)
         {
             loginDetails.ThrowIfNullArgument();
             _loginDetails = loginDetails;
+            _twoFactorCodeProvider = twoFactorCodeProvider;
         }
 
         public void SetCookieContainer(CookieContainer cookieContainer)
@@ -41,7 +44,8 @@ namespace UltimateTeam.Toolkit.Requests
             try
             {
                 var mainPageResponseMessage = await GetMainPageAsync().ConfigureAwait(false);
-                await LoginAsync(_loginDetails, mainPageResponseMessage);
+                if (!(await IsLoggedInAsync()))
+                    await LoginAsync(_loginDetails, mainPageResponseMessage);
                 var nucleusId = await GetNucleusIdAsync();
                 var shards = await GetShardsAsync(nucleusId);
                 var userAccounts = await GetUserAccountsAsync(_loginDetails.Platform);
@@ -54,6 +58,14 @@ namespace UltimateTeam.Toolkit.Requests
             {
                 throw new FutException("Unable to login", e);
             }
+        }
+
+        private async Task<bool> IsLoggedInAsync()
+        {
+            var loginResponse = await HttpClient.GetAsync(Resources.LoggedIn);
+            var loggedInResponse = await Deserialize<IsUserLoggedIn>(loginResponse);
+
+            return loggedInResponse.IsLoggedIn;
         }
 
         private async Task<string> ValidateAsync(LoginDetails loginDetails, string sessionId)
@@ -142,6 +154,7 @@ namespace UltimateTeam.Toolkit.Requests
             return nucleusId;
         }
 
+
         private async Task LoginAsync(LoginDetails loginDetails, HttpResponseMessage mainPageResponseMessage)
         {
             var loginResponseMessage = await HttpClient.PostAsync(mainPageResponseMessage.RequestMessage.RequestUri, new FormUrlEncodedContent(
@@ -155,6 +168,36 @@ namespace UltimateTeam.Toolkit.Requests
                     new KeyValuePair<string, string>("facebookAuth", "")
                 }));
             loginResponseMessage.EnsureSuccessStatusCode();
+
+            //check if twofactorcode is required
+            var contentData = await loginResponseMessage.Content.ReadAsStringAsync();
+            if (contentData.Contains("We sent a security code to your") || contentData.Contains("Your security code was sent to"))
+                await SetTwoFactorCodeAsync(loginResponseMessage);
+        }
+
+        private async Task SetTwoFactorCodeAsync(HttpResponseMessage loginResponse)
+        {
+            var tfCode = await _twoFactorCodeProvider.GetTwoFactorCodeAsync();
+
+            var responseContent = await loginResponse.Content.ReadAsStringAsync();
+
+            AddReferrerHeader(loginResponse.RequestMessage.RequestUri.ToString());
+
+            var codeResponseMessage = await HttpClient.PostAsync(loginResponse.RequestMessage.RequestUri, new FormUrlEncodedContent(
+                        new[]
+                            {
+                                new KeyValuePair<string, string>(responseContent.Contains("twofactorCode") ? "twofactorCode" : "twoFactorCode", tfCode),
+                                new KeyValuePair<string, string>("_eventId", "submit"),
+                                new KeyValuePair<string, string>("_trustThisDevice", "on"),
+                                new KeyValuePair<string, string>("trustThisDevice", "on")
+                            }));
+
+            codeResponseMessage.EnsureSuccessStatusCode();
+
+            var contentData = await codeResponseMessage.Content.ReadAsStringAsync();
+
+            if (contentData.Contains("Incorrect code entered"))
+                throw new FutException("Incorrect TwoFactorCode entered.");
         }
 
         private async Task<HttpResponseMessage> GetMainPageAsync()
@@ -163,6 +206,11 @@ namespace UltimateTeam.Toolkit.Requests
             AddAcceptEncodingHeader();
             var mainPageResponseMessage = await HttpClient.GetAsync(Resources.Home);
             mainPageResponseMessage.EnsureSuccessStatusCode();
+
+            //check if twofactorcode is required
+            var contentData = await mainPageResponseMessage.Content.ReadAsStringAsync();
+            if (contentData.Contains("We sent a security code to your") || contentData.Contains("Your security code was sent to"))
+                await SetTwoFactorCodeAsync(mainPageResponseMessage);
 
             return mainPageResponseMessage;
         }
